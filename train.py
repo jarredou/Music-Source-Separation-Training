@@ -27,8 +27,12 @@ from dataset import MSSDataset
 from utils import demix_track, demix_track_demucs, sdr, get_model_from_config
 
 import warnings
-
 warnings.filterwarnings("ignore")
+
+
+import wandb
+wandb.login()
+
 
 
 def masked_loss(y_, y, q, coarse=True):
@@ -281,6 +285,24 @@ def train_model(args):
             perceptual_weighting=True,
         )
 
+
+    
+    
+    # start a new wandb run to track this script
+    wandb.init(
+        # set the wandb project where this run will be logged
+        project="mss_test",
+        
+        # track hyperparameters and run metadata
+        config={
+        "learning_rate": optimizer.param_groups[0]['lr'],
+        "architecture": args.model_type,
+        "dataset": "MusDB18HQ",
+        "epochs": config.training.num_epochs,
+        }
+    )
+
+
     scaler = GradScaler()
     print('Train for: {}'.format(config.training.num_epochs))
     best_sdr = -100
@@ -339,6 +361,7 @@ def train_model(args):
             li = loss.item() * gradient_accumulation_steps
             loss_val += li
             total += 1
+            wandb.log({"Training Loss": 100 * li})
             pbar.set_postfix({'loss': 100 * li, 'avg_loss': 100 * loss_val / (i + 1)})
             loss.detach()
 
@@ -354,7 +377,7 @@ def train_model(args):
             )
             best_sdr = sdr_avg
         scheduler.step(sdr_avg)
-
+        wandb.log({"Validation Accuracy":sdr_avg})
         # Save last
         store_path = args.results_path + '/last_{}.ckpt'.format(args.model_type)
         state_dict = model.state_dict() if len(device_ids) <= 1 else model.module.state_dict()
@@ -362,6 +385,8 @@ def train_model(args):
             state_dict,
             store_path
         )
+    
+    wandb.finish()
 
 
 if __name__ == "__main__":
