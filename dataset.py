@@ -53,8 +53,8 @@ def get_transforms_simple(instr):
         augment = AU.Compose([
             AU.PitchShift(min_semitones=-3, max_semitones=3, p=0.1),
             AU.PolarityInversion(p=0.5),
-            AU.TanhDistortion(min_distortion=0.1, max_distortion=0.4, p=0.25),
             AU.SevenBandParametricEQ(min_gain_db = -9, max_gain_db=9, p=0.25),
+            AU.TanhDistortion(min_distortion=0.1, max_distortion=0.4, p=0.25),
         ], p=1.0)
     return augment
 
