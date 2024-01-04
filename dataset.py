@@ -13,7 +13,7 @@ from tqdm import tqdm
 from glob import glob
 import audiomentations as AU
 import pedalboard as PB
-
+#import torch_audiomentations as TAU
 
 def load_chunk(path, length, chunk_size, offset=None):
     if chunk_size <= length:
@@ -30,20 +30,32 @@ def load_chunk(path, length, chunk_size, offset=None):
 def get_transforms_simple(instr):
     if instr == 'vocals':
         augment = AU.Compose([
-            AU.TimeStretch(min_rate=0.8, max_rate=1.25, leave_length_unchanged=True, p=0.1),
-            AU.PitchShift(min_semitones=-4, max_semitones=4, p=0.1),
-            AU.Mp3Compression(min_bitrate=32, max_bitrate=320, backend="lameenc", p=0.1), # reduce bitrate (max kbps range: [8, 320]) with probability 0.5
+            AU.PitchShift(min_semitones=-5, max_semitones=5, p=0.1),
+            AU.PolarityInversion(p=0.5),
+            AU.SevenBandParametricEQ(min_gain_db = -9, max_gain_db=9, p=0.25),
+            AU.TanhDistortion(min_distortion=0.1, max_distortion=0.7, p=0.1),
         ], p=1.0)
-    elif instr == 'other':
+    elif instr == 'bass':
         augment = AU.Compose([
-            AU.AddGaussianNoise(min_amplitude=0.001, max_amplitude=0.015, p=0.1),
-            AU.TimeStretch(min_rate=0.8, max_rate=1.25, leave_length_unchanged=True, p=0.1),
-            AU.PitchShift(min_semitones=-4, max_semitones=4, p=0.1),
-            AU.Mp3Compression(min_bitrate=32, max_bitrate=320, backend="lameenc", p=0.1), # reduce bitrate (max kbps range: [8, 320]) with probability 0.5
+            AU.PitchShift(min_semitones=-2, max_semitones=2, p=0.1),
+            AU.PolarityInversion(p=0.5),
+            AU.SevenBandParametricEQ(min_gain_db = -3, max_gain_db=6, p=0.25),
+            AU.TanhDistortion(min_distortion=0.1, max_distortion=0.5, p=0.2),
+        ], p=1.0)
+    elif instr == 'drums':
+        augment = AU.Compose([
+            AU.PitchShift(min_semitones=-5, max_semitones=5, p=0.33),
+            AU.PolarityInversion(p=0.5),
+            AU.SevenBandParametricEQ(min_gain_db = -9, max_gain_db=9, p=0.25),
+            AU.TanhDistortion(min_distortion=0.1, max_distortion=0.6, p=0.33),
         ], p=1.0)
     else:
-        print('Error no augms for: {}'.format(instr))
-        augment = AU.Compose([], p=0.0)
+        augment = AU.Compose([
+            AU.PitchShift(min_semitones=-3, max_semitones=3, p=0.1),
+            AU.PolarityInversion(p=0.5),
+            AU.TanhDistortion(min_distortion=0.1, max_distortion=0.4, p=0.25),
+            AU.SevenBandParametricEQ(min_gain_db = -9, max_gain_db=9, p=0.25),
+        ], p=1.0)
     return augment
 
 
@@ -214,15 +226,21 @@ class MSSDataset(torch.utils.data.Dataset):
     def augm_data(self, source, instr):
         # source.shape = (2, 261120)
 
+        
         # Channel shuffle
-        if random.uniform(0, 1) < 0.5:
+        if random.uniform(0, 1) < 0.25:
             source = source[::-1].copy()
+        """
+        # ALREDY IN SIMPLE AUGs or unused
+
         # Random inverse (do with low probability)
-        if random.uniform(0, 1) < 0.1:
+        if random.uniform(0, 1) < 0.01:
             source = source[:, ::-1].copy()
+
         # Random polarity (multiply -1)
-        if random.uniform(0, 1) < 0.5:
+        if random.uniform(0, 1) < 0.25:
             source = -source.copy()
+        """
 
         if self.augment_func[instr]:
             source_init = source.copy()
@@ -231,29 +249,29 @@ class MSSDataset(torch.utils.data.Dataset):
                 source = source[..., :source_init.shape[-1]]
 
         # Random Reverb
-        if random.uniform(0, 1) < 0.05:
-            room_size = random.uniform(0.1, 0.9)
-            damping = random.uniform(0.1, 0.9)
-            wet_level = random.uniform(0.1, 0.9)
-            dry_level = random.uniform(0.1, 0.9)
-            width = random.uniform(0.9, 1.0)
+        if random.uniform(0, 1) < 0.1:
+            room_size = random.uniform(0.05, 1)
+            damping = random.uniform(0, 1)
+            wet_level = random.uniform(0.05, 1)
+            dry_level = 1
+            width = random.uniform(0, 1.0)
             board = PB.Pedalboard([PB.Reverb(
-                room_size=room_size,  # 0.1 - 0.9
-                damping=damping,  # 0.1 - 0.9
-                wet_level=wet_level,  # 0.1 - 0.9
-                dry_level=dry_level,  # 0.1 - 0.9
-                width=width,  # 0.9 - 1.0
-                freeze_mode=0.0,
+                room_size=room_size,
+                damping=damping,
+                wet_level=wet_level,
+                dry_level=dry_level,
+                width=width,
+                freeze_mode=0,
             )])
             source = board(source, 44100)
 
         # Random Chorus
         if random.uniform(0, 1) < 0.05:
-            rate_hz = random.uniform(1.0, 7.0)
+            rate_hz = random.uniform(0.2, 15.0)
             depth = random.uniform(0.25, 0.95)
             centre_delay_ms = random.uniform(3, 10)
             feedback = random.uniform(0.0, 0.5)
-            mix = random.uniform(0.1, 0.9)
+            mix = random.uniform(0.1, 0.5)
             board = PB.Pedalboard([PB.Chorus(
                 rate_hz=rate_hz,
                 depth=depth,
@@ -265,11 +283,11 @@ class MSSDataset(torch.utils.data.Dataset):
 
         # Random Phazer
         if random.uniform(0, 1) < 0.05:
-            rate_hz = random.uniform(1.0, 10.0)
+            rate_hz = random.uniform(0.2, 15.0)
             depth = random.uniform(0.25, 0.95)
             centre_frequency_hz = random.uniform(200, 12000)
             feedback = random.uniform(0.0, 0.5)
-            mix = random.uniform(0.1, 0.9)
+            mix = random.uniform(0.1, 0.5)
             board = PB.Pedalboard([PB.Phaser(
                 rate_hz=rate_hz,
                 depth=depth,
@@ -279,6 +297,28 @@ class MSSDataset(torch.utils.data.Dataset):
             )])
             source = board(source, 44100)
 
+
+        # Random Bitcrush
+        if random.uniform(0, 1) < 0.05:
+            bit_depth = random.uniform(3, 8)
+            board = PB.Pedalboard([PB.Bitcrush(
+                bit_depth=bit_depth
+            )])
+            source = board(source, 44100)
+
+        
+        """
+        # UNUSED SINCE SAFETY LIMITER ADDED
+        # Random Limiter
+        if random.uniform(0, 1) < 0.2:
+            board = PB.Pedalboard([PB.Limiter(
+              threshold_db = random.uniform(-12, 0),
+              release_ms = random.uniform(5.0, 200.0)
+            )])
+            source = board(source, 44100)
+
+        # audiomentations tanh saturation is way better (better sounding, and gain compensated) !
+        # this one is creating huge volume difference !
         # Random Distortion
         if random.uniform(0, 1) < 0.05:
             drive_db = random.uniform(1.0, 25.0)
@@ -287,14 +327,16 @@ class MSSDataset(torch.utils.data.Dataset):
             )])
             source = board(source, 44100)
 
+        # TOO MUCH SLOW, audiomentations pitchshift is better and 2x faster
         # Random PitchShift
-        if random.uniform(0, 1) < 0.05:
-            semitones = random.uniform(-7, 7)
+        if random.uniform(0, 1) < 0.33:
+            semitones = random.uniform(-4, 4)
             board = PB.Pedalboard([PB.PitchShift(
                 semitones=semitones
             )])
             source = board(source, 44100)
-
+        
+        # NOT USED
         # Random Resample
         if random.uniform(0, 1) < 0.05:
             target_sample_rate = random.uniform(4000, 44100)
@@ -302,15 +344,9 @@ class MSSDataset(torch.utils.data.Dataset):
                 target_sample_rate=target_sample_rate
             )])
             source = board(source, 44100)
-
-        # Random Bitcrash
-        if random.uniform(0, 1) < 0.05:
-            bit_depth = random.uniform(4, 16)
-            board = PB.Pedalboard([PB.Bitcrush(
-                bit_depth=bit_depth
-            )])
-            source = board(source, 44100)
-
+        
+        
+        # ALREADY IN SIMPLE AUGs & UNUSED
         # Random MP3Compressor
         if random.uniform(0, 1) < 0.05:
             vbr_quality = random.uniform(0, 9.999)
@@ -318,8 +354,44 @@ class MSSDataset(torch.utils.data.Dataset):
                 vbr_quality=vbr_quality
             )])
             source = board(source, 44100)
+        """ 
+
+
+        # Parallel crush compressor
+        if random.uniform(0, 1) < 0.1:
+            board = PB.Pedalboard([PB.Compressor(
+              threshold_db = -24,
+              ratio = 4,
+              attack_ms = 1,
+              release_ms = 1
+            )])
+            source_comp = board(source, 44100)
+            source = (4 * source + source_comp) / 5
+
+
+        
+        # Safety pre compressor
+        peak = np.max(np.abs((source)))
+        if peak > 0.9:
+            board = PB.Pedalboard([PB.Compressor(
+              threshold_db = -9,
+              ratio = 2,
+              attack_ms = 1,
+              release_ms = 10
+            )])
+            source = board(source, 44100)
+
+        # Safety Limiter
+        peak = np.max(np.abs((source)))
+        if peak > 1:
+            board = PB.Pedalboard([PB.Limiter(
+              threshold_db = 0,
+              release_ms = random.uniform(5.0, 200.0)
+            )])
+            source = board(source, 44100) * 0.8 # lower volume for better balance with less limited stems
 
         return source
+
 
     def __getitem__(self, index):
         if self.dataset_type in [1, 2, 3]:
@@ -343,8 +415,25 @@ class MSSDataset(torch.utils.data.Dataset):
                         self.config.training.augmentation_loudness_max
                     )
                     res[i] *= loud
+                    
 
+        
         mix = res.sum(0)
+        
+        # Normalise created mixture to (-1, 1)
+        # and apply same gain change on all stems.
+        if 1:
+            peakmix = torch.max(torch.abs(torch.tensor(mix)))
+            mix /= peakmix
+            for i in range(len(res)):
+                res[i] /= peakmix
+        
+        ###
+        ### "MASTERING" STAGE
+        ### SIDECHAINED-LIMITER
+        ### WOULD GO
+        ### HERE 
+        ###
 
         if self.mp3_aug is not None:
             mix = self.mp3_aug(samples=mix, sample_rate=44100)
@@ -354,4 +443,5 @@ class MSSDataset(torch.utils.data.Dataset):
             index = self.config.training.instruments.index(self.config.training.target_instrument)
             return res[index], mix
 
+        # sf.write("mix.wav", mix.T, 44100, subtype='PCM_16')
         return res, mix
