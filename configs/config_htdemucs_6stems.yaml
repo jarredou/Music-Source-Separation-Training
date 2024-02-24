@@ -12,7 +12,7 @@ training:
   samplerate: 44100
   channels: 2
   normalize: true
-  instruments: ['drums', 'bass', 'other', 'vocals']
+  instruments: ['drums', 'bass', 'other', 'vocals', 'guitar', 'piano']
   target_instrument: null
   num_epochs: 1000
   num_steps: 1000
@@ -31,6 +31,16 @@ augmentations:
   loudness: true # randomly change loudness of each stem on the range (loudness_min; loudness_max)
   loudness_min: 0.5
   loudness_max: 1.5
+  mixup: true # mix several stems of same type with some probability (only works for dataset types: 1, 2, 3)
+  mixup_probs: !!python/tuple # 2 additional stems of the same type (1st with prob 0.2, 2nd with prob 0.02)
+    - 0.2
+    - 0.02
+  mixup_loudness_min: 0.5
+  mixup_loudness_max: 1.5
+  all:
+    channel_shuffle: 0.5 # Set 0 or lower to disable
+    random_inverse: 0.1 # inverse track (better lower probability)
+    random_polarity: 0.5 # polarity change (multiply waveform to -1)
 
 inference:
   num_overlap: 4
@@ -74,7 +84,7 @@ htdemucs:  # see demucs/htdemucs.py for a detailed description
   dconv_comp: 8
   dconv_init: 1e-3
   # Before the Transformer
-  bottom_channels: 512
+  bottom_channels: 0
   # CrossTransformer
   # ------ Common to all
   # Regular parameters
