@@ -27,8 +27,12 @@ from dataset import MSSDataset
 from utils import demix_track, demix_track_demucs, sdr, get_model_from_config
 
 import warnings
-
 warnings.filterwarnings("ignore")
+
+
+import wandb
+wandb.login()
+
 
 
 def masked_loss(y_, y, q, coarse=True):
@@ -100,7 +104,7 @@ def load_not_compatible_weights(model, weights, verbose=False):
     )
 
 
-def valid(model, args, config, device, verbose=False):
+def valid(model, args, config, device, verbose=True):
     # For multiGPU extract single model
     if len(args.device_ids) > 1:
         model = model.module
@@ -139,7 +143,9 @@ def valid(model, args, config, device, verbose=False):
                 # other is actually instrumental
                 track, sr1 = sf.read(folder + '/{}.wav'.format('vocals'))
                 track = mix - track
-            # sf.write("{}.wav".format(instr), res[instr].T, sr, subtype='FLOAT')
+            if args.validation_output:
+                # write validation separation
+                sf.write("{}_{}.wav".format(os.path.basename(folder), instr), res[instr].T, sr, subtype='PCM_16')
             references = np.expand_dims(track, axis=0)
             estimates = np.expand_dims(res[instr].T, axis=0)
             sdr_val = sdr(references, estimates)[0]
@@ -153,11 +159,11 @@ def valid(model, args, config, device, verbose=False):
     sdr_avg = 0.0
     for instr in instruments:
         sdr_val = np.array(all_sdr[instr]).mean()
-        print("Instr SDR {}: {:.4f}".format(instr, sdr_val))
+        print("Instr SDR {}: {:.6f}".format(instr, sdr_val))
         sdr_avg += sdr_val
     sdr_avg /= len(instruments)
     if len(instruments) > 1:
-        print('SDR Avg: {:.4f}'.format(sdr_avg))
+        print('SDR Avg: {:.6f}'.format(sdr_avg))
     return sdr_avg
 
 
@@ -176,7 +182,13 @@ def train_model(args):
     parser.add_argument("--device_ids", nargs='+', type=int, default=[0], help='list of gpu ids')
     parser.add_argument("--use_multistft_loss", action='store_true', help="Use MultiSTFT Loss (from auraloss package)")
     parser.add_argument("--use_mse_loss", action='store_true', help="Use default MSE loss")
+    parser.add_argument("--use_log_mse_loss", action='store_true', help="Use log MSE loss")
     parser.add_argument("--use_l1_loss", action='store_true', help="Use L1 loss")
+    parser.add_argument("--use_SISDR_loss", action='store_true', help="Use SISDR loss")
+    parser.add_argument("--use_logcosh_loss", action='store_true', help="Use logcosh loss")
+    parser.add_argument("--resume", action='store_true', help="Full resume mode")
+    parser.add_argument("--validation_output", action='store_true', help="Write validation's separated audio")
+    
     if args is None:
         args = parser.parse_args()
     else:
@@ -220,33 +232,6 @@ def train_model(args):
 
     model = get_model_from_config(args.model_type, config)
 
-    if args.start_check_point != '':
-        print('Start from checkpoint: {}'.format(args.start_check_point))
-        if 1:
-            load_not_compatible_weights(model, args.start_check_point, verbose=False)
-        else:
-            model.load_state_dict(
-                torch.load(args.start_check_point)
-            )
-
-    if torch.cuda.is_available():
-        device_ids = args.device_ids
-        if len(device_ids) <= 1:
-            print('Use single GPU: {}'.format(device_ids))
-            device = torch.device(f'cuda:{device_ids[0]}')
-            model = model.to(device)
-        else:
-            print('Use multi GPU: {}'.format(device_ids))
-            device = torch.device(f'cuda:{device_ids[0]}')
-            model = nn.DataParallel(model, device_ids=device_ids).to(device)
-    else:
-        device = 'cpu'
-        print('CUDA is not avilable. Run training on CPU. It will be very slow...')
-        model = model.to(device)
-
-    if 0:
-        valid(model, args, config, device, verbose=True)
-
     if config.training.optimizer == 'adam':
         optimizer = Adam(model.parameters(), lr=config.training.lr)
     elif config.training.optimizer == 'adamw':
@@ -257,6 +242,58 @@ def train_model(args):
     else:
         print('Unknown optimizer: {}'.format(config.training.optimizer))
         exit()
+
+    if args.start_check_point != '':
+        print('Start from checkpoint: {}'.format(args.start_check_point))
+        if 0:
+            print("Not compatible checkpoint, trying to convert it...")
+            #checkpoint = torch.load(args.start_check_point)
+            # THAT FUNCTION SHOULD BE REWORK TO BE COMPATIBLE WITH FULL RESUME
+            load_not_compatible_weights(model, args.start_check_point, verbose=True)
+            resume_epoch = 0
+        else:
+            checkpoint = torch.load(args.start_check_point)
+            model.load_state_dict(checkpoint['model_state_dict'])
+
+    if torch.cuda.is_available():
+        device_ids = args.device_ids
+        if len(device_ids) <= 1:
+            print('Use single GPU: {}'.format(device_ids))
+            device = torch.device(f'cuda:{device_ids[0]}')
+            model = model.to(device)
+            
+        else:
+            print('Use multi GPU: {}'.format(device_ids))
+            device = torch.device(f'cuda:{device_ids[0]}')
+            model = nn.DataParallel(model, device_ids=device_ids).to(device)
+    
+    else:
+        device = 'cpu'
+        print('CUDA is not avilable. Run training on CPU. It will be very slow...')
+        model = model.to(device)
+    
+    
+    if args.resume:
+        print("Loading optimizer state...")
+        optimizer.load_state_dict(checkpoint['optimizer_state_dict'])
+
+        resume_epoch = checkpoint['epoch'] + 1
+        print(f"Resuming training for epoch {resume_epoch}")
+
+        best_sdr = checkpoint['sdr']
+        print(f"Saved SDR = {best_sdr:.6f}")
+
+        saved_loss = checkpoint['loss'] # unused, just a reminder
+        print(f"Saved training loss = {saved_loss:.6f}") # unused, just a reminder
+    else:
+        resume_epoch = 0
+        print(f"Starting training from epoch {resume_epoch}")
+        best_sdr = -100
+
+
+    if 0:
+        valid(model, args, config, device, verbose=True)
+
 
     gradient_accumulation_steps = 1
     try:
@@ -271,8 +308,22 @@ def train_model(args):
         gradient_accumulation_steps,
         config.training.batch_size * gradient_accumulation_steps,
     ))
+
+
     # Reduce LR if no SDR improvements for several epochs
     scheduler = ReduceLROnPlateau(optimizer, 'max', patience=config.training.patience, factor=config.training.reduce_factor)
+    
+    # load scheduler state
+    if args.resume:
+        print("Loading scheduler state...")
+
+        # force custom patience value
+        # checkpoint['scheduler']['patience'] = 5
+        scheduler.load_state_dict(checkpoint['scheduler'])
+        
+        # force custom lr values during training
+        # optimizer.param_groups[0]['lr'] = 8.0e-5
+      
 
     if args.use_multistft_loss:
         try:
@@ -284,10 +335,33 @@ def train_model(args):
             **loss_options
         )
 
+
+    if args.use_SISDR_loss:
+        SISDR_loss = auraloss.time.SISDRLoss()
+
+    if args.use_logcosh_loss:
+        logcosh_loss = auraloss.time.LogCoshLoss()
+
+    # start a new wandb run to track this script
+    wandb.init(
+        # set the wandb project where this run will be logged
+        project="mss_test",
+        
+        # track hyperparameters and run metadata
+        config={
+        "learning_rate": optimizer.param_groups[0]['lr'],
+        "architecture": args.model_type,
+        "dataset": "MusDB18HQ",
+        "epochs": config.training.num_epochs,
+        }
+    )
+
+
     scaler = GradScaler()
     print('Train for: {}'.format(config.training.num_epochs))
-    best_sdr = -100
+    
     for epoch in range(config.training.num_epochs):
+        epoch += resume_epoch
         model.train()
         print('Train epoch: {} Learning rate: {}'.format(epoch, optimizer.param_groups[0]['lr']))
         loss_val = 0.
@@ -317,10 +391,22 @@ def train_model(args):
                             loss += 1000 * nn.MSELoss()(y1_, y1)
                         if args.use_l1_loss:
                             loss += 1000 * F.l1_loss(y1_, y1)
+                            
                     elif args.use_mse_loss:
                         loss = nn.MSELoss()(y_, y)
+                        
+                    elif args.use_log_mse_loss:
+                        loss = lf.log1p_mse_loss(y_, y)
+                        
                     elif args.use_l1_loss:
-                        loss = F.l1_loss(y_, y)
+                        loss = F.l1_loss(y_, y))
+                        
+                    elif args.use_SISDR_loss:
+                        loss = SISDR_loss(y_,y)
+
+                    elif args.use_logcosh_loss:
+                        loss = logcosh_loss(y_,y)
+
                     else:
                         loss = masked_loss(
                             y_,
@@ -328,7 +414,7 @@ def train_model(args):
                             q=config.training.q,
                             coarse=config.training.coarse_loss_clip
                         )
-
+            
             loss /= gradient_accumulation_steps
             scaler.scale(loss).backward()
             if config.training.grad_clip:
@@ -342,10 +428,16 @@ def train_model(args):
             li = loss.item() * gradient_accumulation_steps
             loss_val += li
             total += 1
-            pbar.set_postfix({'loss': 100 * li, 'avg_loss': 100 * loss_val / (i + 1)})
+
+            
+            avg_loss = 100 * loss_val / (i + 1)
+            pbar.set_postfix({'loss': 100 * li, 'avg_loss': avg_loss})
+            wandb.log({"Training Loss": 100 * li})
             loss.detach()
 
-        print('Training loss: {:.6f}'.format(loss_val / total))
+        training_loss = loss_val / total
+        
+        print('Training loss: {:.6f}'.format(training_loss))
         sdr_avg = valid(model, args, config, device, verbose=False)
         if sdr_avg > best_sdr:
             store_path = args.results_path + '/model_{}_ep_{}_sdr_{:.4f}.ckpt'.format(args.model_type, epoch, sdr_avg)
@@ -356,15 +448,25 @@ def train_model(args):
                 store_path
             )
             best_sdr = sdr_avg
+            
         scheduler.step(sdr_avg)
-
+        wandb.log({"Validation Accuracy":sdr_avg})
+        
         # Save last
         store_path = args.results_path + '/last_{}.ckpt'.format(args.model_type)
         state_dict = model.state_dict() if len(device_ids) <= 1 else model.module.state_dict()
-        torch.save(
-            state_dict,
+        torch.save({
+            'epoch': epoch,
+            'model_state_dict': state_dict,
+            'optimizer_state_dict': optimizer.state_dict(),
+            'scheduler': scheduler.state_dict(),
+            'loss': training_loss,
+            'sdr': best_sdr,
+            },
             store_path
         )
+    
+    wandb.finish()
 
 
 if __name__ == "__main__":
