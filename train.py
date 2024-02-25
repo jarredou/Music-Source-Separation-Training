@@ -29,9 +29,7 @@ from utils import demix_track, demix_track_demucs, sdr, get_model_from_config
 import warnings
 warnings.filterwarnings("ignore")
 
-
 import wandb
-wandb.login()
 
 
 
@@ -185,6 +183,7 @@ def train_model(args):
     parser.add_argument("--use_log_mse_loss", action='store_true', help="Use log MSE loss")
     parser.add_argument("--use_l1_loss", action='store_true', help="Use L1 loss")
     parser.add_argument("--use_SISDR_loss", action='store_true', help="Use SISDR loss")
+    parser.add_argument("--wandb", action='store_true', help="Use wandb logs")
     parser.add_argument("--use_logcosh_loss", action='store_true', help="Use logcosh loss")
     parser.add_argument("--resume", action='store_true', help="Full resume mode")
     parser.add_argument("--validation_output", action='store_true', help="Write validation's separated audio")
@@ -342,19 +341,21 @@ def train_model(args):
     if args.use_logcosh_loss:
         logcosh_loss = auraloss.time.LogCoshLoss()
 
-    # start a new wandb run to track this script
-    wandb.init(
-        # set the wandb project where this run will be logged
-        project="mss_test",
-        
-        # track hyperparameters and run metadata
-        config={
-        "learning_rate": optimizer.param_groups[0]['lr'],
-        "architecture": args.model_type,
-        "dataset": "MusDB18HQ",
-        "epochs": config.training.num_epochs,
-        }
-    )
+
+    if args.wandb:
+        wandb.login()
+        wandb.init(
+            # set the wandb project where this run will be logged
+            project="mss_test",
+            
+            # track hyperparameters and run metadata
+            config={
+            "learning_rate": optimizer.param_groups[0]['lr'],
+            "architecture": args.model_type,
+            "dataset": "MusDB18HQ",
+            "epochs": config.training.num_epochs,
+            }
+        )
 
 
     scaler = GradScaler()
@@ -397,7 +398,7 @@ def train_model(args):
 
                     elif args.use_l1_loss:
                         loss = F.l1_loss(y_, y)
-                        
+
                     elif args.use_SISDR_loss:
                         loss = SISDR_loss(y_,y)
 
@@ -429,7 +430,10 @@ def train_model(args):
             
             avg_loss = 100 * loss_val / (i + 1)
             pbar.set_postfix({'loss': 100 * li, 'avg_loss': avg_loss})
-            wandb.log({"Training Loss": 100 * li})
+
+            if args.wandb:
+                wandb.log({"Training Loss": 100 * li})
+
             loss.detach()
 
         training_loss = loss_val / total
@@ -447,7 +451,9 @@ def train_model(args):
             best_sdr = sdr_avg
             
         scheduler.step(sdr_avg)
-        wandb.log({"Validation Accuracy":sdr_avg})
+        
+        if args.wandb:
+            wandb.log({"Validation Accuracy":sdr_avg})
         
         # Save last
         store_path = args.results_path + '/last_{}.ckpt'.format(args.model_type)
@@ -463,7 +469,8 @@ def train_model(args):
             store_path
         )
     
-    wandb.finish()
+    if args.wandb:
+        wandb.finish()
 
 
 if __name__ == "__main__":
