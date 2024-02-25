@@ -394,12 +394,9 @@ def train_model(args):
                             
                     elif args.use_mse_loss:
                         loss = nn.MSELoss()(y_, y)
-                        
-                    elif args.use_log_mse_loss:
-                        loss = lf.log1p_mse_loss(y_, y)
-                        
+
                     elif args.use_l1_loss:
-                        loss = F.l1_loss(y_, y))
+                        loss = F.l1_loss(y_, y)
                         
                     elif args.use_SISDR_loss:
                         loss = SISDR_loss(y_,y)
