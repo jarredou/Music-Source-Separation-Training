@@ -28,9 +28,9 @@ from dataset import MSSDataset
 from utils import demix_track, demix_track_demucs, sdr, get_model_from_config
 
 import warnings
-
 warnings.filterwarnings("ignore")
 
+import wandb
 
 def masked_loss(y_, y, q, coarse=True):
     # shape = [num_sources, batch_size, num_channels, chunk_size]
@@ -42,7 +42,6 @@ def masked_loss(y_, y, q, coarse=True):
     quantile = torch.quantile(L, q, interpolation='linear', dim=1, keepdim=True)
     mask = L < quantile
     return (loss * mask).mean()
-
 
 def manual_seed(seed):
     random.seed(seed)
@@ -312,6 +311,13 @@ def train_model(args):
     parser.add_argument("--use_multistft_loss", action='store_true', help="Use MultiSTFT Loss (from auraloss package)")
     parser.add_argument("--use_mse_loss", action='store_true', help="Use default MSE loss")
     parser.add_argument("--use_l1_loss", action='store_true', help="Use L1 loss")
+    parser.add_argument("--wandb", action='store_true', help="Use wandb logs")
+    parser.add_argument("--wandb_key", type=str, help="Wandb auth key")
+    parser.add_argument("--wandb_project", type=str, help="Wandb project name")
+    parser.add_argument("--wandb_id", type=str, help="Wandb run id")
+    parser.add_argument("--wandb_dataset", type=str, help="Wandb run dataset name")
+    parser.add_argument("--resume", action='store_true', help="Full resume mode")
+    
     if args is None:
         args = parser.parse_args()
     else:
@@ -362,12 +368,15 @@ def train_model(args):
 
     if args.start_check_point != '':
         print('Start from checkpoint: {}'.format(args.start_check_point))
-        if 1:
-            load_not_compatible_weights(model, args.start_check_point, verbose=False)
+        if 0:
+            print("Not compatible checkpoint, trying to convert it...")
+            #checkpoint = torch.load(args.start_check_point)
+            # THAT FUNCTION SHOULD BE REWORK TO BE COMPATIBLE WITH FULL RESUME
+            load_not_compatible_weights(model, args.start_check_point, verbose=True)
+            resume_epoch = 0
         else:
-            model.load_state_dict(
-                torch.load(args.start_check_point)
-            )
+            checkpoint = torch.load(args.start_check_point)
+            model.load_state_dict(checkpoint['model_state_dict'])
 
     if torch.cuda.is_available():
         if len(device_ids) <= 1:
@@ -382,7 +391,24 @@ def train_model(args):
         device = 'cpu'
         print('CUDA is not avilable. Run training on CPU. It will be very slow...')
         model = model.to(device)
+        
+    if args.resume:
+        print("Loading optimizer state...")
+        optimizer.load_state_dict(checkpoint['optimizer_state_dict'])
 
+        resume_epoch = checkpoint['epoch'] + 1
+        print(f"Resuming training for epoch {resume_epoch}")
+
+        best_sdr = checkpoint['sdr']
+        print(f"Saved SDR = {best_sdr:.6f}")
+
+        saved_loss = checkpoint['loss'] # unused, just a reminder
+        print(f"Saved training loss = {saved_loss:.6f}") # unused, just a reminder
+    else:
+        resume_epoch = 0
+        print(f"Starting training from epoch {resume_epoch}")
+        best_sdr = -100
+        
     if 0:
         valid_multi_gpu(model, args, config, verbose=True)
 
@@ -413,6 +439,19 @@ def train_model(args):
     # Reduce LR if no SDR improvements for several epochs
     scheduler = ReduceLROnPlateau(optimizer, 'max', patience=config.training.patience, factor=config.training.reduce_factor)
 
+    if args.resume:
+        print("Loading scheduler state...")
+
+        # force custom scheduler value
+        # checkpoint['scheduler']['patience'] = 6
+        # checkpoint['scheduler']['factor'] = 0.95
+
+        # load scheduler state
+        scheduler.load_state_dict(checkpoint['scheduler'])
+        
+        # force custom lr values during training
+        # optimizer.param_groups[0]['lr'] = 8.0e-5
+    
     if args.use_multistft_loss:
         try:
             loss_options = dict(config.loss_multistft)
@@ -422,6 +461,39 @@ def train_model(args):
         loss_multistft = auraloss.freq.MultiResolutionSTFTLoss(
             **loss_options
         )
+
+    
+    if args.wandb:
+        wandb.login(key=args.wandb_key)
+        if args.resume:
+            wandb.init(
+                # set the wandb project where this run will be logged
+                project=args.wandb_project,
+                id=args.wandb_id,
+                # track hyperparameters and run metadata
+                config={
+                "learning_rate": optimizer.param_groups[0]['lr'],
+                "architecture": args.model_type,
+                "dataset": args.wandb_dataset,
+                "epochs": config.training.num_epochs,
+                "training config": config,
+                },
+                resume=True
+            )
+        else:
+            wandb.init(
+                # set the wandb project where this run will be logged
+                project=args.wandb_project,
+                id=args.wandb_id,
+                # track hyperparameters and run metadata
+                config={
+                "learning_rate": optimizer.param_groups[0]['lr'],
+                "architecture": args.model_type,
+                "dataset": args.wandb_dataset,
+                "epochs": config.training.num_epochs,
+                "training conf": config,
+                }
+            )
 
     scaler = GradScaler()
     print('Train for: {}'.format(config.training.num_epochs))
@@ -484,15 +556,11 @@ def train_model(args):
             pbar.set_postfix({'loss': 100 * li, 'avg_loss': 100 * loss_val / (i + 1)})
             loss.detach()
 
-        print('Training loss: {:.6f}'.format(loss_val / total))
+            if args.wandb:
+                wandb.log({"Training Loss": 100 * li})
 
-        # Save last
-        store_path = args.results_path + '/last_{}.ckpt'.format(args.model_type)
-        state_dict = model.state_dict() if len(device_ids) <= 1 else model.module.state_dict()
-        torch.save(
-            state_dict,
-            store_path
-        )
+        training_loss = (loss_val / total) * 100
+        print('Training loss: {:.6f}'.format(training_loss))
 
         # if you have problem with multiproc validation change 0 to 1
         if 0:
@@ -509,6 +577,26 @@ def train_model(args):
             )
             best_sdr = sdr_avg
         scheduler.step(sdr_avg)
+        
+        if args.wandb:
+            wandb.log({"Validation Accuracy":sdr_avg, "Training Loss (Mean)":training_loss, "Epoch":epoch}, commit=True)
+
+        # Save last
+        store_path = args.results_path + '/last_{}.ckpt'.format(args.model_type)
+        state_dict = model.state_dict() if len(device_ids) <= 1 else model.module.state_dict()
+        torch.save({
+            'epoch': epoch,
+            'model_state_dict': state_dict,
+            'optimizer_state_dict': optimizer.state_dict(),
+            'scheduler': scheduler.state_dict(),
+            'loss': training_loss,
+            'sdr': best_sdr,
+            },
+            store_path
+        )
+
+    if args.wandb:
+        wandb.finish()
 
 
 if __name__ == "__main__":
