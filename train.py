@@ -4,11 +4,8 @@ __version__ = '1.0.2'
 
 import random
 import argparse
-import yaml
 import time
 import copy
-from ml_collections import ConfigDict
-from omegaconf import OmegaConf
 from tqdm import tqdm
 import sys
 import os
@@ -105,7 +102,12 @@ def valid(model, args, config, device, verbose=False):
         model = model.module
 
     model.eval()
-    all_mixtures_path = sorted(glob.glob(args.valid_path + '/*/mixture.wav'))
+    all_mixtures_path = []
+    for valid_path in args.valid_path:
+        part = sorted(glob.glob(valid_path + '/*/mixture.wav'))
+        if len(part) == 0:
+            print('No validation data found in: {}'.format(valid_path))
+        all_mixtures_path += part
     if verbose:
         print('Total mixtures: {}'.format(len(all_mixtures_path)))
 
@@ -252,7 +254,12 @@ def valid_multi_gpu(model, args, config, verbose=False):
     if len(device_ids) > 1:
         model = model.module
 
-    all_mixtures_path = sorted(glob.glob(args.valid_path + '/*/mixture.wav'))
+    all_mixtures_path = []
+    for valid_path in args.valid_path:
+        part = sorted(glob.glob(valid_path + '/*/mixture.wav'))
+        if len(part) == 0:
+            print('No validation data found in: {}'.format(valid_path))
+        all_mixtures_path += part
 
     model = model.to('cpu')
     torch.cuda.empty_cache()
@@ -301,9 +308,9 @@ def train_model(args):
     parser.add_argument("--config_path", type=str, help="path to config file")
     parser.add_argument("--start_check_point", type=str, default='', help="Initial checkpoint to start training")
     parser.add_argument("--results_path", type=str, help="path to folder where results will be stored (weights, metadata)")
-    parser.add_argument("--data_path", nargs="+", type=str, help="dataset path. Can be several parameters.")
+    parser.add_argument("--data_path", nargs="+", type=str, help="Dataset data paths. You can provide several folders.")
     parser.add_argument("--dataset_type", type=int, default=1, help="Dataset type. Must be one of: 1, 2, 3 or 4. Details here: https://github.com/ZFTurbo/Music-Source-Separation-Training/blob/main/docs/dataset_types.md")
-    parser.add_argument("--valid_path", type=str, help="validate path")
+    parser.add_argument("--valid_path", nargs="+", type=str, help="validation data paths. You can provide several folders.")
     parser.add_argument("--num_workers", type=int, default=0, help="dataloader num_workers")
     parser.add_argument("--pin_memory", type=bool, default=False, help="dataloader pin_memory")
     parser.add_argument("--seed", type=int, default=0, help="random seed")
@@ -328,12 +335,7 @@ def train_model(args):
     torch.backends.cudnn.deterministic = False # Fix possible slow down with dilation convolutions
     torch.multiprocessing.set_start_method('spawn')
 
-    with open(args.config_path) as f:
-        if args.model_type == 'htdemucs':
-            config = OmegaConf.load(args.config_path)
-        else:
-            config = ConfigDict(yaml.load(f, Loader=yaml.FullLoader))
-
+    model, config = get_model_from_config(args.model_type, args.config_path)
     print("Instruments: {}".format(config.training.instruments))
 
     if not os.path.isdir(args.results_path):
@@ -363,8 +365,6 @@ def train_model(args):
         num_workers=args.num_workers,
         pin_memory=args.pin_memory
     )
-
-    model = get_model_from_config(args.model_type, config)
 
     if args.start_check_point != '':
         print('Start from checkpoint: {}'.format(args.start_check_point))

@@ -2,10 +2,8 @@
 __author__ = 'Roman Solovyev (ZFTurbo): https://github.com/ZFTurbo/'
 
 import argparse
-import yaml
 import time
-from ml_collections import ConfigDict
-from omegaconf import OmegaConf
+import librosa
 from tqdm import tqdm
 import sys
 import os
@@ -23,8 +21,8 @@ warnings.filterwarnings("ignore")
 def run_folder(model, args, config, device, verbose=False):
     start_time = time.time()
     model.eval()
-    all_mixtures_path = glob.glob(args.input_folder + '/*.wav')
-    print('Total tracks found: {}'.format(len(all_mixtures_path)))
+    all_mixtures_path = glob.glob(args.input_folder + '/*.*')
+    print('Total files found: {}'.format(len(all_mixtures_path)))
 
     instruments = config.training.instruments
     if config.training.target_instrument is not None:
@@ -37,7 +35,14 @@ def run_folder(model, args, config, device, verbose=False):
         all_mixtures_path = tqdm(all_mixtures_path)
 
     for path in all_mixtures_path:
-        mix, sr = sf.read(path)
+        try:
+            # mix, sr = sf.read(path)
+            mix, sr = librosa.load(path, sr=44100, mono=False)
+            mix = mix.T
+        except Exception as e:
+            print('Can read track: {}'.format(path))
+            print('Error message: {}'.format(str(e)))
+            continue
 
         # Convert mono to stereo if needed
         if len(mix.shape) == 1:
@@ -70,15 +75,7 @@ def proc_folder(args):
 
     torch.backends.cudnn.benchmark = True
 
-    with open(args.config_path) as f:
-        if args.model_type == 'htdemucs':
-            config = OmegaConf.load(args.config_path)
-        else:
-            config = ConfigDict(yaml.load(f, Loader=yaml.FullLoader))
-
-    print("Instruments: {}".format(config.training.instruments))
-
-    model = get_model_from_config(args.model_type, config)
+    model, config = get_model_from_config(args.model_type, args.config_path)
     if args.start_check_point != '':
         print('Start from checkpoint: {}'.format(args.start_check_point))
         state_dict = torch.load(args.start_check_point)
@@ -87,6 +84,7 @@ def proc_folder(args):
             if 'state' in state_dict:
                 state_dict = state_dict['state']
         model.load_state_dict(state_dict)
+    print("Instruments: {}".format(config.training.instruments))
 
     if torch.cuda.is_available():
         device_ids = args.device_ids
