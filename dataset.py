@@ -37,6 +37,7 @@ class MSSDataset(torch.utils.data.Dataset):
         if batch_size is None:
             batch_size = config.training.batch_size
         self.batch_size = batch_size
+        self.file_types = ['wav', 'flac']
 
         # Augmentation block
         self.aug = False
@@ -67,7 +68,15 @@ class MSSDataset(torch.utils.data.Dataset):
                     # Check lengths of all instruments (it can be different in some cases)
                     lengths_arr = []
                     for instr in instruments:
-                        length = len(sf.read(path + f'/{instr}.wav')[0])
+                        length = -1
+                        for extension in self.file_types:
+                            path_to_audio_file = path + '/{}.{}'.format(instr, extension)
+                            if os.path.isfile(path_to_audio_file):
+                                length = len(sf.read(path_to_audio_file)[0])
+                                break
+                        if length == -1:
+                            print('Cant find file "{}" in folder {}'.format(instr, path))
+                            continue
                         lengths_arr.append(length)
                     lengths_arr = np.array(lengths_arr)
                     if lengths_arr.min() != lengths_arr.max():
@@ -86,8 +95,10 @@ class MSSDataset(torch.utils.data.Dataset):
                     if type(data_path) == list:
                         for tp in data_path:
                             track_paths += sorted(glob(tp + '/{}/*.wav'.format(instr)))
+                            track_paths += sorted(glob(tp + '/{}/*.flac'.format(instr)))
                     else:
                         track_paths += sorted(glob(data_path + '/{}/*.wav'.format(instr)))
+                        track_paths += sorted(glob(data_path + '/{}/*.flac'.format(instr)))
 
                     for path in tqdm(track_paths):
                         length = len(sf.read(path)[0])
@@ -132,7 +143,11 @@ class MSSDataset(torch.utils.data.Dataset):
             pickle.dump(metadata, open(metadata_path, 'wb'))
 
         if self.dataset_type in [1, 4]:
-            print('Found tracks in dataset: {}'.format(len(metadata)))
+            if len(metadata) > 0:
+                print('Found tracks in dataset: {}'.format(len(metadata)))
+            else:
+                print('No tracks found for training. Check paths you provided!')
+                exit()
         else:
             for instr in self.instruments:
                 print('Found tracks for {} in dataset: {}'.format(instr, len(metadata[instr])))
@@ -147,10 +162,25 @@ class MSSDataset(torch.utils.data.Dataset):
         while True:
             if self.dataset_type in [1, 4]:
                 track_path, track_length = random.choice(metadata)
-                source = load_chunk(track_path + f'/{instr}.wav', track_length, self.chunk_size)
+                for extension in self.file_types:
+                    path_to_audio_file = track_path + '/{}.{}'.format(instr, extension)
+                    if os.path.isfile(path_to_audio_file):
+                        try:
+                            source = load_chunk(path_to_audio_file, track_length, self.chunk_size)
+                        except Exception as e:
+                            # Sometimes error during FLAC reading, catch it and use zero stem
+                            print('Error: {} Path: {}'.format(e, path_to_audio_file))
+                            source = np.zeros((2, self.chunk_size), dtype=np.float32)
+                        break
             else:
                 track_path, track_length = random.choice(metadata[instr])
-                source = load_chunk(track_path, track_length, self.chunk_size)
+                try:
+                    source = load_chunk(track_path, track_length, self.chunk_size)
+                except Exception as e:
+                    # Sometimes error during FLAC reading, catch it and use zero stem
+                    print('Error: {} Path: {}'.format(e, track_path))
+                    source = np.zeros((2, self.chunk_size), dtype=np.float32)
+
             if np.abs(source).mean() >= self.min_mean_abs:  # remove quiet chunks
                 break
         if self.aug:
@@ -189,7 +219,16 @@ class MSSDataset(torch.utils.data.Dataset):
         for i in self.instruments:
             attempts = 10
             while attempts:
-                source = load_chunk(track_path + f'/{i}.wav', track_length, self.chunk_size)
+                for extension in self.file_types:
+                    path_to_audio_file = track_path + '/{}.{}'.format(i, extension)
+                    if os.path.isfile(path_to_audio_file):
+                        try:
+                            source = load_chunk(path_to_audio_file, track_length, self.chunk_size)
+                        except Exception as e:
+                            # Sometimes error during FLAC reading, catch it and use zero stem
+                            print('Error: {} Path: {}'.format(e, path_to_audio_file))
+                            source = np.zeros((2, self.chunk_size), dtype=np.float32)
+                        break
                 if np.abs(source).mean() >= self.min_mean_abs:  # remove quiet chunks
                     break
                 attempts -= 1

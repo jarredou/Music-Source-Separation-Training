@@ -26,6 +26,9 @@ def get_model_from_config(model_type, config_path):
     elif model_type == 'segm_models':
         from models.segm_models import Segm_Models_Net
         model = Segm_Models_Net(config)
+    elif model_type == 'torchseg':
+        from models.torchseg_models import Torchseg_Net
+        model = Torchseg_Net(config)
     elif model_type == 'mel_band_roformer':
         from models.bs_roformer import MelBandRoformer
         model = MelBandRoformer(
@@ -44,6 +47,11 @@ def get_model_from_config(model_type, config_path):
         model = MultiMaskMultiSourceBandSplitRNNSimple(
             **config.model
         )
+    elif model_type == 'scnet_unofficial':
+        from models.scnet_unofficial import SCNet
+        model = SCNet(
+            **config.model
+        )
     elif model_type == 'scnet':
         from models.scnet import SCNet
         model = SCNet(
@@ -59,6 +67,7 @@ def get_model_from_config(model_type, config_path):
 def demix_track(config, model, mix, device):
     C = config.audio.chunk_size
     N = config.inference.num_overlap
+    fade_size = C // 10
     step = int(C // N)
     border = C - step
     batch_size = config.inference.batch_size
@@ -69,6 +78,18 @@ def demix_track(config, model, mix, device):
     if length_init > 2 * border and (border > 0):
         mix = nn.functional.pad(mix, (border, border), mode='reflect')
 
+    # Prepare windows arrays (do 1 time for speed up). This trick repairs click problems on the edges of segment
+    window_size = C
+    fadein = torch.linspace(0, 1, fade_size)
+    fadeout = torch.linspace(1, 0, fade_size)
+    window_start = torch.ones(window_size)
+    window_middle = torch.ones(window_size)
+    window_finish = torch.ones(window_size)
+    window_start[-fade_size:] *= fadeout # First audio chunk, no fadein
+    window_finish[:fade_size] *= fadein # Last audio chunk, no fadeout
+    window_middle[-fade_size:] *= fadeout
+    window_middle[:fade_size] *= fadein
+
     with torch.cuda.amp.autocast():
         with torch.inference_mode():
             if config.training.target_instrument is not None:
@@ -76,15 +97,14 @@ def demix_track(config, model, mix, device):
             else:
                 req_shape = (len(config.training.instruments),) + tuple(mix.shape)
 
-            mix = mix.to(device)
-            result = torch.zeros(req_shape, dtype=torch.float32).to(device)
-            counter = torch.zeros(req_shape, dtype=torch.float32).to(device)
+            result = torch.zeros(req_shape, dtype=torch.float32)
+            counter = torch.zeros(req_shape, dtype=torch.float32)
             i = 0
             batch_data = []
             batch_locations = []
             while i < mix.shape[1]:
                 # print(i, i + C, mix.shape[1])
-                part = mix[:, i:i + C]
+                part = mix[:, i:i + C].to(device)
                 length = part.shape[-1]
                 if length < C:
                     if length > C // 2 + 1:
@@ -98,10 +118,18 @@ def demix_track(config, model, mix, device):
                 if len(batch_data) >= batch_size or (i >= mix.shape[1]):
                     arr = torch.stack(batch_data, dim=0)
                     x = model(arr)
+
+                    window = window_middle
+                    if i - step == 0:  # First audio chunk, no fadein
+                        window = window_start
+                    elif i >= mix.shape[1]:  # Last audio chunk, no fadeout
+                        window = window_finish
+
                     for j in range(len(batch_locations)):
                         start, l = batch_locations[j]
-                        result[..., start:start+l] += x[j][..., :l]
-                        counter[..., start:start+l] += 1.
+                        result[..., start:start+l] += x[j][..., :l].cpu() * window[..., :l]
+                        counter[..., start:start+l] += window[..., :l]
+
                     batch_data = []
                     batch_locations = []
 
@@ -127,18 +155,17 @@ def demix_track_demucs(config, model, mix, device):
     step = C // N
     # print(S, C, N, step, mix.shape, mix.device)
 
-    with torch.cuda.amp.autocast():
+    with torch.cuda.amp.autocast(enabled=config.training.use_amp):
         with torch.inference_mode():
-            mix = mix.to(device)
             req_shape = (S, ) + tuple(mix.shape)
-            result = torch.zeros(req_shape, dtype=torch.float32).to(device)
-            counter = torch.zeros(req_shape, dtype=torch.float32).to(device)
+            result = torch.zeros(req_shape, dtype=torch.float32)
+            counter = torch.zeros(req_shape, dtype=torch.float32)
             i = 0
             batch_data = []
             batch_locations = []
             while i < mix.shape[1]:
                 # print(i, i + C, mix.shape[1])
-                part = mix[:, i:i + C]
+                part = mix[:, i:i + C].to(device)
                 length = part.shape[-1]
                 if length < C:
                     part = nn.functional.pad(input=part, pad=(0, C - length, 0, 0), mode='constant', value=0)
@@ -151,7 +178,7 @@ def demix_track_demucs(config, model, mix, device):
                     x = model(arr)
                     for j in range(len(batch_locations)):
                         start, l = batch_locations[j]
-                        result[..., start:start+l] += x[j][..., :l]
+                        result[..., start:start+l] += x[j][..., :l].cpu()
                         counter[..., start:start+l] += 1.
                     batch_data = []
                     batch_locations = []
