@@ -5,6 +5,8 @@ __version__ = '1.0.3'
 import random
 import argparse
 import time
+from ml_collections import ConfigDict
+from omegaconf import OmegaConf
 import copy
 from tqdm import tqdm
 import sys
@@ -20,14 +22,15 @@ from torch.utils.data import DataLoader
 from torch.cuda.amp.grad_scaler import GradScaler
 from torch.optim.lr_scheduler import ReduceLROnPlateau
 import torch.nn.functional as F
+import torchaudio
 
 from dataset import MSSDataset
 from utils import demix_track, demix_track_demucs, sdr, get_model_from_config
 
 import warnings
+#warnings.filterwarnings("ignore")
 
-warnings.filterwarnings("ignore")
-
+import wandb
 
 def masked_loss(y_, y, q, coarse=True):
     # shape = [num_sources, batch_size, num_channels, chunk_size]
@@ -97,12 +100,14 @@ def load_not_compatible_weights(model, weights, verbose=False):
         new_model
     )
 
-def valid(model, args, config, device, verbose=False):
+
+def valid(model, args, config, device, verbose=True, epoch=0):
     # For multiGPU extract single model
     if len(args.device_ids) > 1:
         model = model.module
 
     model.eval()
+
     all_mixtures_path = []
     for valid_path in args.valid_path:
         part = sorted(glob.glob(valid_path + '/*/mixture.wav'))
@@ -136,14 +141,19 @@ def valid(model, args, config, device, verbose=False):
             res = demix_track(config, model, mixture, device)
         for instr in instruments:
             if instr != 'other' or config.training.other_fix is False:
-                track, sr1 = sf.read(folder + '/{}.wav'.format(instr))
+                #print(f"1 {instr}")
+                track, sr1 = sf.read(folder + '/{}.flac'.format(instr))
             else:
+                #print(f"2 {instr}")
                 # other is actually instrumental
-                track, sr1 = sf.read(folder + '/{}.wav'.format('vocals'))
+                track, sr1 = sf.read(folder + '/{}.flac'.format(instr))
                 track = mix - track
-            # sf.write("{}.wav".format(instr), res[instr].T, sr, subtype='FLOAT')
+            if args.validation_output:
+                # write validation separation
+                sf.write("ep{}_{}_{}.flac".format(epoch, os.path.basename(folder), instr), res[instr].T, sr, subtype='PCM_16')
             references = np.expand_dims(track, axis=0)
             estimates = np.expand_dims(res[instr].T, axis=0)
+            #print(f"{estimates.shape}")
             sdr_val = sdr(references, estimates)[0]
             if verbose:
                 print(instr, res[instr].shape, sdr_val)
@@ -155,11 +165,11 @@ def valid(model, args, config, device, verbose=False):
     sdr_avg = 0.0
     for instr in instruments:
         sdr_val = np.array(all_sdr[instr]).mean()
-        print("Instr SDR {}: {:.4f}".format(instr, sdr_val))
+        print("Instr SDR {}: {:.6f}".format(instr, sdr_val))
         sdr_avg += sdr_val
     sdr_avg /= len(instruments)
     if len(instruments) > 1:
-        print('SDR Avg: {:.4f}'.format(sdr_avg))
+        print('SDR Avg: {:.6f}'.format(sdr_avg))
     return sdr_avg
 
 
@@ -300,6 +310,7 @@ def valid_multi_gpu(model, args, config, verbose=False):
     sdr_avg /= len(instruments)
     if len(instruments) > 1:
         print('SDR Avg: {:.4f}'.format(sdr_avg))
+
     return sdr_avg
 
 
@@ -318,7 +329,17 @@ def train_model(args):
     parser.add_argument("--device_ids", nargs='+', type=int, default=[0], help='list of gpu ids')
     parser.add_argument("--use_multistft_loss", action='store_true', help="Use MultiSTFT Loss (from auraloss package)")
     parser.add_argument("--use_mse_loss", action='store_true', help="Use default MSE loss")
+    parser.add_argument("--use_log_stft_loss", action='store_true', help="Use log multi STFT loss")
     parser.add_argument("--use_l1_loss", action='store_true', help="Use L1 loss")
+    parser.add_argument("--use_SISDR_loss", action='store_true', help="Use SISDR loss")
+    parser.add_argument("--use_STFT_loss", action='store_true', help="Use STFT loss")
+    parser.add_argument("--wandb", action='store_true', help="Use wandb logs")
+    parser.add_argument("--wandb_key", type=str, help="Wandb auth key")
+    parser.add_argument("--wandb_id", type=str, help="Wandb run id")
+    parser.add_argument("--use_logcosh_loss", action='store_true', help="Use logcosh loss")
+    parser.add_argument("--resume", action='store_true', help="Full resume mode")
+    parser.add_argument("--validation_output", action='store_true', help="Write validation's separated audio")
+
     if args is None:
         args = parser.parse_args()
     else:
@@ -327,7 +348,6 @@ def train_model(args):
     manual_seed(args.seed + int(time.time()))
     torch.backends.cudnn.benchmark = True
     torch.backends.cudnn.deterministic = False # Fix possible slow down with dilation convolutions
-    torch.multiprocessing.set_start_method('spawn')
 
     model, config = get_model_from_config(args.model_type, args.config_path)
     print("Instruments: {}".format(config.training.instruments))
@@ -341,50 +361,22 @@ def train_model(args):
     except:
         pass
 
-    device_ids = args.device_ids
-    batch_size = config.training.batch_size * len(device_ids)
-
     trainset = MSSDataset(
         config,
         args.data_path,
-        batch_size=batch_size,
         metadata_path=os.path.join(args.results_path, 'metadata_{}.pkl'.format(args.dataset_type)),
         dataset_type=args.dataset_type,
     )
 
     train_loader = DataLoader(
         trainset,
-        batch_size=batch_size,
+        batch_size=config.training.batch_size,
         shuffle=True,
         num_workers=args.num_workers,
         pin_memory=args.pin_memory
     )
 
-    if args.start_check_point != '':
-        print('Start from checkpoint: {}'.format(args.start_check_point))
-        if 1:
-            load_not_compatible_weights(model, args.start_check_point, verbose=False)
-        else:
-            model.load_state_dict(
-                torch.load(args.start_check_point)
-            )
-
-    if torch.cuda.is_available():
-        if len(device_ids) <= 1:
-            print('Use single GPU: {}'.format(device_ids))
-            device = torch.device(f'cuda:{device_ids[0]}')
-            model = model.to(device)
-        else:
-            print('Use multi GPU: {}'.format(device_ids))
-            device = torch.device(f'cuda:{device_ids[0]}')
-            model = nn.DataParallel(model, device_ids=device_ids).to(device)
-    else:
-        device = 'cpu'
-        print('CUDA is not avilable. Run training on CPU. It will be very slow...')
-        model = model.to(device)
-
-    if 0:
-        valid_multi_gpu(model, args, config, verbose=True)
+    model = get_model_from_config(args.model_type, config)
 
     if config.training.optimizer == 'adam':
         optimizer = Adam(model.parameters(), lr=config.training.lr)
@@ -397,6 +389,58 @@ def train_model(args):
         print('Unknown optimizer: {}'.format(config.training.optimizer))
         exit()
 
+    if args.start_check_point != '':
+        print('Start from checkpoint: {}'.format(args.start_check_point))
+        if 0:
+            print("Not compatible checkpoint, trying to convert it...")
+            #checkpoint = torch.load(args.start_check_point)
+            # THAT FUNCTION SHOULD BE REWORK TO BE COMPATIBLE WITH FULL RESUME
+            load_not_compatible_weights(model, args.start_check_point, verbose=True)
+            resume_epoch = 0
+        else:
+            checkpoint = torch.load(args.start_check_point)
+            model.load_state_dict(checkpoint['model_state_dict'])
+
+    if torch.cuda.is_available():
+        device_ids = args.device_ids
+        if len(device_ids) <= 1:
+            print('Use single GPU: {}'.format(device_ids))
+            device = torch.device(f'cuda:{device_ids[0]}')
+            model = model.to(device)
+            
+        else:
+            print('Use multi GPU: {}'.format(device_ids))
+            device = torch.device(f'cuda:{device_ids[0]}')
+            model = nn.DataParallel(model, device_ids=device_ids).to(device)
+    
+    else:
+        device = 'cpu'
+        print('CUDA is not avilable. Run training on CPU. It will be very slow...')
+        model = model.to(device)
+    
+    
+    if args.resume:
+        print("Loading optimizer state...")
+        optimizer.load_state_dict(checkpoint['optimizer_state_dict'])
+
+        resume_epoch = checkpoint['epoch'] + 1
+        print(f"Resuming training for epoch {resume_epoch}")
+
+        best_sdr = checkpoint['sdr']
+        print(f"Saved SDR = {best_sdr:.6f}")
+
+        saved_loss = checkpoint['loss'] # unused, just a reminder
+        print(f"Saved training loss = {saved_loss:.6f}") # unused, just a reminder
+    else:
+        resume_epoch = 0
+        print(f"Starting training from epoch {resume_epoch}")
+        best_sdr = -100
+
+
+    if 0:
+        valid(model, args, config, device, verbose=True)
+
+
     gradient_accumulation_steps = 1
     try:
         gradient_accumulation_steps = int(config.training.gradient_accumulation_steps)
@@ -406,28 +450,107 @@ def train_model(args):
     print("Patience: {} Reduce factor: {} Batch size: {} Grad accum steps: {} Effective batch size: {}".format(
         config.training.patience,
         config.training.reduce_factor,
-        batch_size,
+        config.training.batch_size,
         gradient_accumulation_steps,
-        batch_size * gradient_accumulation_steps,
+        config.training.batch_size * gradient_accumulation_steps,
     ))
+
+
     # Reduce LR if no SDR improvements for several epochs
     scheduler = ReduceLROnPlateau(optimizer, 'max', patience=config.training.patience, factor=config.training.reduce_factor)
+    
+    
+    if args.resume:
+        print("Loading scheduler state...")
 
+        # force custom scheduler value
+        # checkpoint['scheduler']['patience'] = 6
+        # checkpoint['scheduler']['factor'] = 0.95
+
+        # load scheduler state
+        scheduler.load_state_dict(checkpoint['scheduler'])
+        
+        
+        # force custom lr values during training
+        # optimizer.param_groups[0]['lr'] = 8.0e-5
+        
+        
+    # epsilon value
+    EPS = 1e-08
+    
     if args.use_multistft_loss:
-        try:
-            loss_options = dict(config.loss_multistft)
-        except:
-            loss_options = dict()
-        print('Loss options: {}'.format(loss_options))
-        loss_multistft = auraloss.freq.MultiResolutionSTFTLoss(
-            **loss_options
+        # define the loss function
+        multistft_loss = auraloss.freq.MultiResolutionSTFTLoss(
+            fft_sizes=[1024, 2048, 8192],
+            hop_sizes=[256, 512, 2048],
+            win_lengths=[1024, 2048, 8192],
+            w_sc=1,
+            scale="mel",
+            n_bins=128,
+            w_log_mag=1,
+            w_lin_mag=0,
+            sample_rate=44100,
+            perceptual_weighting=False,
+            mag_distance="L1"
         )
+    
+
+    if args.use_log_stft_loss:
+        STFT_loss = auraloss.freq.STFTLoss(
+          mag_distance="L1",
+          fft_size=4096,
+          hop_size=1024,
+          w_log_mag=1, # default
+          w_lin_mag=0, # default
+          w_sc=1, # default
+          )
+
+    if args.use_SISDR_loss:
+        SISDR_loss = auraloss.time.SISDRLoss()
+
+    if args.use_logcosh_loss:
+        logcosh_loss = auraloss.time.LogCoshLoss()
+
+
+    if args.wandb:
+        wandb.login(key=args.wandb_key)
+        if args.resume:
+            wandb.init(
+                # set the wandb project where this run will be logged
+                project="mss_test",
+                id=args.wandb_id,
+                # track hyperparameters and run metadata
+                config={
+                "learning_rate": optimizer.param_groups[0]['lr'],
+                "architecture": args.model_type,
+                "dataset": "RB-BASS",
+                "epochs": config.training.num_epochs,
+                "training conf": config,
+                },
+                resume=True
+            )
+        else:
+            wandb.init(
+                # set the wandb project where this run will be logged
+                project="mss_test",
+                id=args.wandb_id,
+                # track hyperparameters and run metadata
+                config={
+                "learning_rate": optimizer.param_groups[0]['lr'],
+                "architecture": args.model_type,
+                "dataset": "RB-BASS",
+                "epochs": config.training.num_epochs,
+                "training conf": config,
+                }
+            )        
+
 
     scaler = GradScaler()
     print('Train for: {}'.format(config.training.num_epochs))
-    best_sdr = -100
+    
     for epoch in range(config.training.num_epochs):
-        model.train().to(device)
+        epoch += resume_epoch
+        model.train()
         print('Train epoch: {} Learning rate: {}'.format(epoch, optimizer.param_groups[0]['lr']))
         loss_val = 0.
         total = 0
@@ -447,19 +570,32 @@ def train_model(args):
                         loss = loss.mean()
                 else:
                     y_ = model(x)
+                    
                     if args.use_multistft_loss:
-                        y1_ = torch.reshape(y_, (y_.shape[0], y_.shape[1] * y_.shape[2], y_.shape[3]))
-                        y1 = torch.reshape(y, (y.shape[0], y.shape[1] * y.shape[2], y.shape[3]))
-                        loss = loss_multistft(y1_, y1)
-                        # We can use many losses at the same time
-                        if args.use_mse_loss:
-                            loss += 1000 * nn.MSELoss()(y1_, y1)
-                        if args.use_l1_loss:
-                            loss += 1000 * F.l1_loss(y1_, y1)
+                        loss = multistft_loss(y_, y)
+
+                    # if args.use_multistft_loss:
+                    #    loss =  10 * torch.log10(multistft_loss(y_, y) + EPS)
+
+                    if args.use_log_stft_loss:
+                        loss = (10 * torch.log10(1 + STFT_loss(y_, y))) * 1.25
+                        loss += (400 * torch.log10(1 + F.l1_loss(y_, y))) * 0.75
+
                     elif args.use_mse_loss:
                         loss = nn.MSELoss()(y_, y)
+
                     elif args.use_l1_loss:
-                        loss = F.l1_loss(y_, y)
+                        loss = 10 * torch.log10(F.l1_loss(y_, y) + EPS)
+
+                    elif args.use_SISDR_loss:
+                        loss = SISDR_loss(y_,y)
+
+                    elif args.use_STFT_loss:
+                        loss = STFT_loss(y_,y)
+
+                    elif args.use_logcosh_loss:
+                        loss = logcosh_loss(y_,y)
+
                     else:
                         loss = masked_loss(
                             y_,
@@ -467,7 +603,7 @@ def train_model(args):
                             q=config.training.q,
                             coarse=config.training.coarse_loss_clip
                         )
-
+            
             loss /= gradient_accumulation_steps
             scaler.scale(loss).backward()
             if config.training.grad_clip:
@@ -481,25 +617,22 @@ def train_model(args):
             li = loss.item() * gradient_accumulation_steps
             loss_val += li
             total += 1
-            pbar.set_postfix({'loss': 100 * li, 'avg_loss': 100 * loss_val / (i + 1)})
+
+            
+            avg_loss = 100 * loss_val / (i + 1)
+            pbar.set_postfix({'loss': 100 * li, 'avg_loss': avg_loss})
+
+            if args.wandb:
+                wandb.log({"Training Loss": 100 * li})
+
             loss.detach()
 
-        print('Training loss: {:.6f}'.format(loss_val / total))
-
-        # Save last
-        store_path = args.results_path + '/last_{}.ckpt'.format(args.model_type)
-        state_dict = model.state_dict() if len(device_ids) <= 1 else model.module.state_dict()
-        torch.save(
-            state_dict,
-            store_path
-        )
-
-        # if you have problem with multiproc validation change 0 to 1
-        if 0:
-            sdr_avg = valid(model, args, config, device, verbose=False)
-        else:
-            sdr_avg = valid_multi_gpu(model, args, config, verbose=False)
+        training_loss = (loss_val / total) * 100
+        
+        print('Training loss: {:.6f}'.format(training_loss))
+        sdr_avg = valid(model, args, config, device, verbose=False, epoch=epoch)
         if sdr_avg > best_sdr:
+            best_sdr = sdr_avg
             store_path = args.results_path + '/model_{}_ep_{}_sdr_{:.4f}.ckpt'.format(args.model_type, epoch, sdr_avg)
             print('Store weights: {}'.format(store_path))
             state_dict = model.state_dict() if len(device_ids) <= 1 else model.module.state_dict()
@@ -507,8 +640,29 @@ def train_model(args):
                 state_dict,
                 store_path
             )
-            best_sdr = sdr_avg
+            
+            
         scheduler.step(sdr_avg)
+        
+        if args.wandb:
+            wandb.log({"Validation Accuracy":sdr_avg, "Training Loss (Mean)":training_loss, "Epoch":epoch}, commit=True)
+        
+        # Save last
+        store_path = args.results_path + '/last_{}.ckpt'.format(args.model_type)
+        state_dict = model.state_dict() if len(device_ids) <= 1 else model.module.state_dict()
+        torch.save({
+            'epoch': epoch,
+            'model_state_dict': state_dict,
+            'optimizer_state_dict': optimizer.state_dict(),
+            'scheduler': scheduler.state_dict(),
+            'loss': training_loss,
+            'sdr': best_sdr,
+            },
+            store_path
+        )
+    
+    if args.wandb:
+        wandb.finish()
 
 
 if __name__ == "__main__":

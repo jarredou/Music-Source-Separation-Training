@@ -30,14 +30,17 @@ def load_chunk(path, length, chunk_size, offset=None):
 
 
 class MSSDataset(torch.utils.data.Dataset):
-    def __init__(self, config, data_path, metadata_path="metadata.pkl", dataset_type=1, batch_size=None):
+    def __init__(self, config, data_path, metadata_path="metadata.pkl", dataset_type=1):
         self.config = config
         self.dataset_type = dataset_type # 1, 2, 3 or 4
         self.instruments = instruments = config.training.instruments
+
+
         if batch_size is None:
             batch_size = config.training.batch_size
         self.batch_size = batch_size
         self.file_types = ['wav', 'flac']
+
 
         # Augmentation block
         self.aug = False
@@ -65,6 +68,10 @@ class MSSDataset(torch.utils.data.Dataset):
 
                 track_paths = [path for path in track_paths if os.path.basename(path)[0] != '.' and os.path.isdir(path)]
                 for path in tqdm(track_paths):
+
+                    length = len(sf.read(path + f'/{instruments[0]}.flac')[0])
+                    metadata.append((path, length))
+
                     # Check lengths of all instruments (it can be different in some cases)
                     lengths_arr = []
                     for instr in instruments:
@@ -87,6 +94,7 @@ class MSSDataset(torch.utils.data.Dataset):
                         )
                     # We use minimum to allow overflow for soundfile read in non-equal length cases
                     metadata.append((path, lengths_arr.min()))
+
             elif self.dataset_type == 2:
                 metadata = dict()
                 for instr in self.instruments:
@@ -94,11 +102,12 @@ class MSSDataset(torch.utils.data.Dataset):
                     track_paths = []
                     if type(data_path) == list:
                         for tp in data_path:
-                            track_paths += sorted(glob(tp + '/{}/*.wav'.format(instr)))
+
                             track_paths += sorted(glob(tp + '/{}/*.flac'.format(instr)))
                     else:
-                        track_paths += sorted(glob(data_path + '/{}/*.wav'.format(instr)))
-                        track_paths += sorted(glob(data_path + '/{}/*.flac'.format(instr)))
+                            track_paths += sorted(glob(tp + '/{}/*.wav'.format(instr)))
+                            track_paths += sorted(glob(tp + '/{}/*.flac'.format(instr)))
+
 
                     for path in tqdm(track_paths):
                         length = len(sf.read(path)[0])
@@ -156,22 +165,12 @@ class MSSDataset(torch.utils.data.Dataset):
         self.min_mean_abs = config.audio.min_mean_abs
 
     def __len__(self):
-        return self.config.training.num_steps * self.batch_size
+        return self.config.training.num_steps * self.config.training.batch_size
 
     def load_source(self, metadata, instr):
         while True:
             if self.dataset_type in [1, 4]:
                 track_path, track_length = random.choice(metadata)
-                for extension in self.file_types:
-                    path_to_audio_file = track_path + '/{}.{}'.format(instr, extension)
-                    if os.path.isfile(path_to_audio_file):
-                        try:
-                            source = load_chunk(path_to_audio_file, track_length, self.chunk_size)
-                        except Exception as e:
-                            # Sometimes error during FLAC reading, catch it and use zero stem
-                            print('Error: {} Path: {}'.format(e, path_to_audio_file))
-                            source = np.zeros((2, self.chunk_size), dtype=np.float32)
-                        break
             else:
                 track_path, track_length = random.choice(metadata[instr])
                 try:
@@ -193,22 +192,21 @@ class MSSDataset(torch.utils.data.Dataset):
             s1 = self.load_source(self.metadata, instr)
             # Mixup augmentation. Multiple mix of same type of stems
             if self.aug:
-                if 'mixup' in self.config['augmentations']:
-                    if self.config['augmentations'].mixup:
-                        mixup = [s1]
-                        for prob in self.config.augmentations.mixup_probs:
-                            if random.uniform(0, 1) < prob:
-                                s2 = self.load_source(self.metadata, instr)
-                                mixup.append(s2)
-                        mixup = torch.stack(mixup, dim=0)
-                        loud_values = np.random.uniform(
-                            low=self.config.augmentations.loudness_min,
-                            high=self.config.augmentations.loudness_max,
-                            size=(len(mixup),)
-                        )
-                        loud_values = torch.tensor(loud_values, dtype=torch.float32)
-                        mixup *= loud_values[:, None, None]
-                        s1 = mixup.mean(dim=0, dtype=torch.float32)
+                if self.config.augmentations.mixup:
+                    mixup = [s1]
+                    for prob in self.config.augmentations.mixup_probs:
+                        if random.uniform(0, 1) < prob:
+                            s2 = self.load_source(self.metadata, instr)
+                            mixup.append(s2)
+                    mixup = torch.stack(mixup, dim=0)
+                    loud_values = np.random.uniform(
+                        low=self.config.augmentations.loudness_min,
+                        high=self.config.augmentations.loudness_max,
+                        size=(len(mixup),)
+                    )
+                    loud_values = torch.tensor(loud_values, dtype=torch.float32)
+                    mixup *= loud_values[:, None, None]
+                    s1 = mixup.mean(dim=0, dtype=torch.float32)
             res.append(s1)
         res = torch.stack(res)
         return res
@@ -219,6 +217,7 @@ class MSSDataset(torch.utils.data.Dataset):
         for i in self.instruments:
             attempts = 10
             while attempts:
+
                 for extension in self.file_types:
                     path_to_audio_file = track_path + '/{}.{}'.format(i, extension)
                     if os.path.isfile(path_to_audio_file):
@@ -541,6 +540,15 @@ class MSSDataset(torch.utils.data.Dataset):
                     res *= loud_values[:, None, None]
 
         mix = res.sum(0)
+        #print(mix.shape)
+        """
+        # Normalise mixture & stems with same gain to keep volume balance
+        peak_mix = torch.max(torch.abs(mix))
+        mix /= peak_mix
+
+        for i in range(len(res)):
+            res /= peak_mix
+        """
 
         if self.aug:
             if 'mp3_compression_on_mixture' in self.config['augmentations']:
