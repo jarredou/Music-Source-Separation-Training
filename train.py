@@ -104,7 +104,7 @@ def valid(model, args, config, device, verbose=False):
     model.eval()
     all_mixtures_path = []
     for valid_path in args.valid_path:
-        part = sorted(glob.glob(valid_path + '/*/mixture.wav'))
+        part = sorted(glob.glob(valid_path + '/*/MIXTURE.flac'))
         if len(part) == 0:
             print('No validation data found in: {}'.format(valid_path))
         all_mixtures_path += part
@@ -135,12 +135,12 @@ def valid(model, args, config, device, verbose=False):
             res = demix_track(config, model, mixture, device)
         for instr in instruments:
             if instr != 'other' or config.training.other_fix is False:
-                track, sr1 = sf.read(folder + '/{}.wav'.format(instr))
+                track, sr1 = sf.read(folder + '/{}.flac'.format(instr))
             else:
                 # other is actually instrumental
-                track, sr1 = sf.read(folder + '/{}.wav'.format('vocals'))
+                track, sr1 = sf.read(folder + '/{}.flac'.format('vocals'))
                 track = mix - track
-            # sf.write("{}.wav".format(instr), res[instr].T, sr, subtype='FLOAT')
+            # sf.write("{}.flac".format(instr), res[instr].T, sr, subtype='FLOAT')
             references = np.expand_dims(track, axis=0)
             estimates = np.expand_dims(res[instr].T, axis=0)
             sdr_val = sdr(references, estimates)[0]
@@ -203,13 +203,13 @@ def proc_list_of_files(
             for instr in instruments:
                 if instr != 'other' or config.training.other_fix is False:
                     try:
-                        track, sr1 = sf.read(folder + '/{}.wav'.format(instr))
+                        track, sr1 = sf.read(folder + '/{}.flac'.format(instr))
                     except Exception as e:
                         # print('No data for stem: {}. Skip!'.format(instr))
                         continue
                 else:
                     # other is actually instrumental
-                    track, sr1 = sf.read(folder + '/{}.wav'.format('vocals'))
+                    track, sr1 = sf.read(folder + '/{}.flac'.format('vocals'))
                     track = mix_orig - track
 
                 references = np.expand_dims(track, axis=0)
@@ -265,7 +265,7 @@ def valid_multi_gpu(model, args, config, verbose=False):
 
     all_mixtures_path = []
     for valid_path in args.valid_path:
-        part = sorted(glob.glob(valid_path + '/*/mixture.wav'))
+        part = sorted(glob.glob(valid_path + '/*/MIXTURE.flac'))
         if len(part) == 0:
             print('No validation data found in: {}'.format(valid_path))
         all_mixtures_path += part
@@ -400,24 +400,7 @@ def train_model(args):
         device = 'cpu'
         print('CUDA is not avilable. Run training on CPU. It will be very slow...')
         model = model.to(device)
-        
-    if args.resume:
-        print("Loading optimizer state...")
-        optimizer.load_state_dict(checkpoint['optimizer_state_dict'])
-
-        resume_epoch = checkpoint['epoch'] + 1
-        print(f"Resuming training for epoch {resume_epoch}")
-
-        best_sdr = checkpoint['sdr']
-        print(f"Saved SDR = {best_sdr:.6f}")
-
-        saved_loss = checkpoint['loss'] # unused, just a reminder
-        print(f"Saved training loss = {saved_loss:.6f}") # unused, just a reminder
-    else:
-        resume_epoch = 0
-        print(f"Starting training from epoch {resume_epoch}")
-        best_sdr = -100
-        
+               
     if 0:
         valid_multi_gpu(model, args, config, verbose=True)
 
@@ -439,6 +422,24 @@ def train_model(args):
         gradient_accumulation_steps = int(config.training.gradient_accumulation_steps)
     except:
         pass
+
+    if args.resume:
+        print("Loading optimizer state...")
+        optimizer.load_state_dict(checkpoint['optimizer_state_dict'])
+
+        resume_epoch = checkpoint['epoch'] + 1
+        print(f"Resuming training for epoch {resume_epoch}")
+
+        best_sdr = checkpoint['sdr']
+        print(f"Saved SDR = {best_sdr:.6f}")
+
+        saved_loss = checkpoint['loss'] # unused, just a reminder
+        print(f"Saved training loss = {saved_loss:.6f}") # unused, just a reminder
+    else:
+        resume_epoch = 0
+        print(f"Starting training from epoch {resume_epoch}")
+        best_sdr = -100
+
 
     print("Patience: {} Reduce factor: {} Batch size: {} Grad accum steps: {} Effective batch size: {}".format(
         config.training.patience,
