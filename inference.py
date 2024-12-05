@@ -94,12 +94,20 @@ def run_folder(model, args, config, device, verbose=False):
             waveforms[el] = waveforms[el] / len(full_result)
 
         # Create a new `instr` in instruments list, 'instrumental' 
-        if args.extract_instrumental:
-            instr = 'vocals' if 'vocals' in instruments else instruments[0]
-            if 'instrumental' not in instruments:
-                instruments.append('instrumental')
-            # Output "instrumental", which is an inverse of 'vocals' or the first stem in list if 'vocals' absent
-            waveforms['instrumental'] = mix_orig - waveforms[instr]
+        if args.extract_instrumental and config.training.target_instrument != null:
+            # Create a list of instruments excluding the target instrument
+            second_stem = [s for s in config.training.instruments if s != config.training.target_instrument]
+            
+            # Choose a single instrument from second_stem
+            if second_stem:
+                # If there are elements in second_stem, use the first one (or handle according to your logic)
+                second_stem_key = second_stem[0]  
+                
+                if second_stem_key not in instruments:
+                    instruments.append(second_stem_key)
+                
+                # Output "instrumental", which is an inverse of 'vocals' or the first stem in list if 'vocals' absent
+                waveforms[second_stem_key] = mix_orig - waveforms[instruments[0]]
 
         for instr in instruments:
             estimates = waveforms[instr].T
