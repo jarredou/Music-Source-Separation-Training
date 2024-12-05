@@ -94,7 +94,7 @@ def run_folder(model, args, config, device, verbose=False):
             waveforms[el] = waveforms[el] / len(full_result)
 
         # Create a new `instr` in instruments list, 'instrumental' 
-        if args.extract_instrumental and config.training.target_instrument != null:
+        if args.extract_instrumental and config.training.target_instrument is not None:
             # Create a list of instruments excluding the target instrument
             second_stem = [s for s in config.training.instruments if s != config.training.target_instrument]
             
