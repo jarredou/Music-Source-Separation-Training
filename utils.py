@@ -223,7 +223,7 @@ def demix(
 
     batch_size = config.inference.batch_size
 
-    use_amp = config.training.get(key='use_amp', default=True)
+    use_amp = config.training.get('use_amp', True)
 
     with torch.cuda.amp.autocast(enabled=use_amp):
         with torch.inference_mode():
