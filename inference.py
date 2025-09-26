@@ -56,9 +56,13 @@ def run_folder(model, args, config, device, verbose=False):
             print('Error message: {}'.format(str(e)))
             continue
 
-        # Convert mono to stereo if needed
+       # If mono audio we must adjust it depending on model
         if len(mix.shape) == 1:
-            mix = np.stack([mix, mix], axis=0)
+            mix = np.expand_dims(mix, axis=0)
+            if 'num_channels' in config.audio:
+                if config.audio['num_channels'] == 2:
+                    print(f'Convert mono track to stereo...')
+                    mix = np.concatenate([mix, mix], axis=0)
 
         mix_orig = mix.copy()
         if 'normalize' in config.inference:
