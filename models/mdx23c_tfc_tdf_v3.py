@@ -10,6 +10,8 @@ class STFT:
         self.hop_length = config.hop_length
         self.window = torch.hann_window(window_length=self.n_fft, periodic=True)
         self.dim_f = config.dim_f
+        self.length = config.chunk_size
+        self.chans = config.num_channels
 
     def __call__(self, x):
         window = self.window.to(x.device)
@@ -39,8 +41,8 @@ class STFT:
         x = x.reshape([*batch_dims, c // 2, 2, n, t]).reshape([-1, 2, n, t])
         x = x.permute([0, 2, 3, 1])
         x = x[..., 0] + x[..., 1] * 1.j
-        x = torch.istft(x, n_fft=self.n_fft, hop_length=self.hop_length, window=window, center=True)
-        x = x.reshape([*batch_dims, 2, -1])
+        x = torch.istft(x, n_fft=self.n_fft, hop_length=self.hop_length, window=window, center=True, length=self.length)
+        x = x.reshape([*batch_dims, self.chans, -1])
         return x
 
 
