@@ -22,9 +22,9 @@ def bigshifts_wrapper(
     device: torch.device,
     model_type: str,
     pbar: bool = False,
-    bigshifts: int = 1
+    bigshifts: int = 1,
+    progress_bar=None
 ) -> Union[Dict[str, np.ndarray], np.ndarray]:
-    """BigShifts wrapper for inference-time demixing."""
 
     should_print = not dist.is_initialized() or dist.get_rank() == 0
 
@@ -38,14 +38,25 @@ def bigshifts_wrapper(
     shifts = [x * shift_in_samples for x in range(bigshifts)]
     results = []
 
-    if pbar and should_print:
-        shifts_iterator = tqdm(shifts, desc="BigShifts passes...", leave=False)
-    else:
-        shifts_iterator = shifts
+    for shift_idx, shift in enumerate(shifts):
+        shifted_mix = np.concatenate((mix[:, -shift:], mix[:, :-shift]), axis=-1) if shift > 0 else mix.copy()
 
-    for shift in shifts_iterator:
-        shifted_mix = np.concatenate((mix[:, -shift:], mix[:, :-shift]), axis=-1)
-        sources = demix(config, model, shifted_mix, device, model_type, pbar)
+        if progress_bar is not None:
+            base_desc = progress_bar.desc.split(' pass')[0]
+            if bigshifts > 1:
+                progress_bar.set_description(f"{base_desc} pass {shift_idx + 1}/{bigshifts}")
+            else:
+                progress_bar.set_description(base_desc)
+            progress_bar.reset(total=mix.shape[-1])
+        sources = demix(
+            config,
+            model,
+            shifted_mix,
+            device,
+            model_type,
+            pbar=False,
+            progress_bar=progress_bar
+        )
 
         if isinstance(sources, dict):
             unshifted = {
@@ -56,15 +67,12 @@ def bigshifts_wrapper(
         elif isinstance(sources, np.ndarray):
             unshifted = np.concatenate((sources[..., shift:], sources[..., :shift]), axis=-1)
             results.append(unshifted)
-        else:
-            raise ValueError("Unsupported return type from demix")
 
     if isinstance(results[0], dict):
-        avg_result = {}
-        for k in results[0]:
-            avg_result[k] = np.mean([r[k] for r in results], axis=0)
-        return avg_result
+        return {k: np.mean([r[k] for r in results], axis=0) for k in results[0]}
     return np.mean(results, axis=0)
+
+
 
 
 def demix(
@@ -73,33 +81,9 @@ def demix(
     mix: torch.Tensor,
     device: torch.device,
     model_type: str,
-    pbar: bool = False
+    pbar: bool = False,
+    progress_bar=None
 ) -> Union[Dict[str, np.ndarray], np.ndarray]:
-    """
-    Perform audio source separation with a given model.
-
-    Supports both Demucs-specific and generic processing modes, including
-    overlapping chunk-based inference with optional progress bar display.
-    Handles padding, fading, and batching to reduce artifacts during separation.
-
-    Args:
-        config (ConfigDict): Configuration object with audio and inference
-            parameters (chunk size, overlap, batch size, etc.).
-        model (torch.nn.Module): Source separation model for inference.
-        mix (torch.Tensor): Input audio tensor of shape (channels, time).
-        device (torch.device): Device on which to run inference (CPU or CUDA).
-        model_type (str): Type of model (e.g., 'htdemucs', 'mdx23c') that
-            determines processing mode.
-        pbar (bool, optional): If True, show a progress bar during chunk
-            processing. Defaults to False.
-
-    Returns:
-        Union[Dict[str, np.ndarray], np.ndarray]:
-            - Dictionary mapping instrument names to separated waveforms if
-              multiple instruments are predicted.
-            - NumPy array of separated audio if only a single instrument is
-              present (Demucs mode).
-    """
 
     should_print = not dist.is_initialized() or dist.get_rank() == 0
 
@@ -109,7 +93,7 @@ def demix(
         mode = 'demucs'
     else:
         mode = 'generic'
-    # Define processing parameters based on the mode
+
     if mode == 'demucs':
         chunk_size = config.training.samplerate * config.training.segment
         num_instruments = len(config.training.instruments)
@@ -128,17 +112,15 @@ def demix(
         border = chunk_size - step
         length_init = mix.shape[-1]
         windowing_array = _getWindowingArray(chunk_size, fade_size)
-        # Add padding for generic mode to handle edge artifacts
+
         if length_init > 2 * border and border > 0:
             mix = nn.functional.pad(mix, (border, border), mode="reflect")
 
     batch_size = config.inference.batch_size
-
     use_amp = getattr(config.training, 'use_amp', True)
 
     with torch.cuda.amp.autocast(enabled=use_amp):
         with torch.inference_mode():
-            # Initialize result and counter tensors
             req_shape = (num_instruments,) + mix.shape
             result = torch.zeros(req_shape, dtype=torch.float32)
             counter = torch.zeros(req_shape, dtype=torch.float32)
@@ -146,15 +128,8 @@ def demix(
             i = 0
             batch_data = []
             batch_locations = []
-            if pbar and should_print:
-                progress_bar = tqdm(
-                    total=mix.shape[1], desc="Processing audio chunks", leave=False
-                )
-            else:
-                progress_bar = None
 
             while i < mix.shape[1]:
-                # Extract chunk and apply padding if necessary
                 part = mix[:, i:i + chunk_size].to(device)
                 chunk_len = part.shape[-1]
                 if mode == "generic" and chunk_len > chunk_size // 2:
@@ -167,16 +142,15 @@ def demix(
                 batch_locations.append((i, chunk_len))
                 i += step
 
-                # Process batch if it's full or the end is reached
                 if len(batch_data) >= batch_size or i >= mix.shape[1]:
                     arr = torch.stack(batch_data, dim=0)
                     x = model(arr)
 
                     if mode == "generic":
-                        window = windowing_array.clone() # using clone() fixes the clicks at chunk edges when using batch_size=1
-                        if i - step == 0:  # First audio chunk, no fadein
+                        window = windowing_array.clone()
+                        if i - step == 0:
                             window[:fade_size] = 1
-                        elif i >= mix.shape[1]:  # Last audio chunk, no fadeout
+                        elif i >= mix.shape[1]:
                             window[-fade_size:] = 1
 
                     for j, (start, seg_len) in enumerate(batch_locations):
@@ -187,26 +161,23 @@ def demix(
                             result[..., start:start + seg_len] += x[j, ..., :seg_len].cpu()
                             counter[..., start:start + seg_len] += 1.0
 
+                    # ✅ Update once per batch by step*batch_size, capped at remaining length
+                    if progress_bar is not None:
+                        progress_bar.update(min(step * len(batch_locations), progress_bar.total - progress_bar.n))
+
                     batch_data.clear()
                     batch_locations.clear()
 
-                if progress_bar:
-                    progress_bar.update(step)
+            # no close() here
 
-            if progress_bar:
-                progress_bar.close()
-
-            # Compute final estimated sources
             estimated_sources = result / counter
             estimated_sources = estimated_sources.cpu().numpy()
             np.nan_to_num(estimated_sources, copy=False, nan=0.0)
 
-            # Remove padding for generic mode
             if mode == "generic":
                 if length_init > 2 * border and border > 0:
                     estimated_sources = estimated_sources[..., border:-border]
 
-    # Return the result as a dictionary or a single array
     if mode == "demucs":
         instruments = config.training.instruments
     else:
@@ -218,6 +189,8 @@ def demix(
         return estimated_sources
     else:
         return ret_data
+
+
 
 
 def initialize_model_and_device(model: torch.nn.Module, device_ids: List[int]) ->\
@@ -389,33 +362,19 @@ def apply_tta(
     device: torch.device,
     model_type: str,
     bigshifts: int = 1,
-    pbar: bool = False
+    pbar: bool = False,
+    progress_bar=None  # ✅ new param
 ) -> Union[dict[str, np.ndarray], np.ndarray]:
-    """
-    Enhance source separation results using Test-Time Augmentation (TTA).
 
-    Applies augmentations such as channel reversal and polarity inversion to
-    the input mixture, reprocesses with the model, and combines the results
-    with the original predictions by averaging.
-
-    Args:
-        config: Configuration object with model and inference parameters.
-        model (torch.nn.Module): Trained source separation model.
-        mix (torch.Tensor): Input mixture tensor of shape (channels, time).
-        waveforms_orig (Dict[str, torch.Tensor]): Dictionary of separated
-            sources before augmentation.
-        device (torch.device): Computation device (CPU or CUDA).
-        model_type (str): Model type identifier used for demixing.
-
-    Returns:
-        Dict[str, torch.Tensor]: Dictionary of separated sources after applying TTA.
-    """
-
-    # Create augmentations: channel inversion and polarity inversion
     track_proc_list = [mix[::-1].copy(), -1.0 * mix.copy()]
 
-    # Process each augmented mixture
     for i, augmented_mix in enumerate(track_proc_list):
+        # Update bar description to show TTA pass
+        if progress_bar is not None:
+            # strip any previous suffix and add TTA label
+            base_desc = progress_bar.desc.split(' pass')[0].split(' TTA')[0]
+            progress_bar.set_description(f"{base_desc} TTA {i + 1}/{len(track_proc_list)}")
+
         waveforms = bigshifts_wrapper(
             config,
             model,
@@ -423,7 +382,8 @@ def apply_tta(
             device,
             model_type=model_type,
             bigshifts=bigshifts,
-            pbar=pbar
+            pbar=pbar,
+            progress_bar=progress_bar  # ✅ forwarded
         )
         for el in waveforms:
             if i == 0:
@@ -431,7 +391,6 @@ def apply_tta(
             else:
                 waveforms_orig[el] -= waveforms[el]
 
-    # Average the results across augmentations
     for el in waveforms_orig:
         waveforms_orig[el] /= len(track_proc_list) + 1
 
