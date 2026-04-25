@@ -33,27 +33,10 @@ def run_folder(
     device: "torch.device",
     verbose: bool = False
 ) -> None:
-    """
-    Process a folder of audio files for source separation.
-
-    Parameters:
-    ----------
-    model : torch.nn.Module
-        Pre-trained model for source separation.
-    args : argparse.Namespace
-        Arguments containing input folder, output folder, and processing options.
-    config : dict
-        Configuration object with audio and inference settings.
-    device : torch.device
-        Device for model inference (CPU or CUDA).
-    verbose : bool, optional
-        If True, prints detailed information during processing. Default is False.
-    """
 
     start_time = time.time()
     model.eval()
 
-    # Recursively collect all files from input directory
     mixture_paths = sorted(
         glob.glob(os.path.join(args.input_folder, "**/*.*"), recursive=True)
     )
@@ -66,20 +49,21 @@ def run_folder(
     instruments: list[str] = prefer_target_instrument(config)[:]
     os.makedirs(args.store_dir, exist_ok=True)
 
-    # Wrap paths with progress bar if not in verbose mode
-    if not verbose:
-        mixture_paths = tqdm(mixture_paths, desc="Total progress")
-
-    # Determine whether to use detailed progress bar
     if args.disable_detailed_pbar:
         detailed_pbar = False
     else:
         detailed_pbar = True
 
-    for path in mixture_paths:
-        # Get relative path from input folder
+    # Compute step size once for progress bar total calculation
+    if 'chunk_size' in config.inference:
+        chunk_size = config.inference.chunk_size
+    else:
+        chunk_size = config.audio.chunk_size
+    num_overlap = config.inference.num_overlap
+    step = chunk_size // num_overlap
+
+    for idx, path in enumerate(mixture_paths):
         relative_path: str = os.path.relpath(path, args.input_folder)
-        # Extract directory and file name
         dir_name: str = os.path.dirname(relative_path)
         file_name: str = os.path.splitext(os.path.basename(path))[0]
 
@@ -90,7 +74,6 @@ def run_folder(
             print(f"Error message: {str(e)}")
             continue
 
-        # Convert mono audio to expected channel format if needed
         if len(mix.shape) == 1:
             mix = np.expand_dims(mix, axis=0)
             if "num_channels" in config.audio:
@@ -100,20 +83,29 @@ def run_folder(
 
         mix_orig = mix.copy()
 
-        # Normalize input audio if enabled
         if "normalize" in config.inference:
             if config.inference["normalize"] is True:
                 mix, norm_params = normalize_audio(mix)
 
-        # Perform source separation
+        # One bar per file, reset() handles multiple shifts inside bigshifts_wrapper
+        progress_bar = tqdm(
+            total=mix.shape[-1],
+            desc=f"[{idx+1}/{len(mixture_paths)}] {os.path.basename(path)}",
+            leave=True,
+            dynamic_ncols=True,
+            unit="samples",
+            unit_scale=True
+        )
+
         waveforms_orig = bigshifts_wrapper(
             config,
             model,
             mix,
             device,
             model_type=args.model_type,
-            pbar=detailed_pbar,
-            bigshifts=args.bigshifts
+            pbar=False,
+            bigshifts=args.bigshifts,
+            progress_bar=progress_bar
         )
 
         # Apply test-time augmentation if enabled
@@ -126,10 +118,12 @@ def run_folder(
                 device,
                 args.model_type,
                 bigshifts=args.bigshifts,
-                pbar=detailed_pbar
+                pbar=False,
+                progress_bar=progress_bar  # ✅ pass bar into TTA
             )
 
-        # Extract instrumental track if requested
+        progress_bar.close()
+
         if args.extract_instrumental:
             instr = "vocals" if "vocals" in instruments else instruments[0]
             waveforms_orig["instrumental"] = mix_orig - waveforms_orig[instr]
@@ -139,7 +133,6 @@ def run_folder(
         for instr in instruments:
             estimates = waveforms_orig[instr]
 
-            # Denormalize output audio if normalization was applied
             if "normalize" in config.inference:
                 if config.inference["normalize"] is True:
                     estimates = denormalize_audio(estimates, norm_params)
@@ -152,7 +145,6 @@ def run_folder(
 
             subtype = args.pcm_type
 
-            # Generate output directory structure using relative paths
             dirnames, fname = format_filename(
                 args.filename_template,
                 instr=instr,
@@ -165,14 +157,12 @@ def run_folder(
                 )[0],
             )
 
-            # Create output directory
             output_dir: str = os.path.join(args.store_dir, *dirnames)
             os.makedirs(output_dir, exist_ok=True)
 
             output_path: str = os.path.join(output_dir, f"{fname}.{codec}")
             sf.write(output_path, estimates.T, sr, subtype=subtype)
 
-            # Draw and save spectrogram if enabled
             if args.draw_spectro > 0:
                 output_img_path = os.path.join(output_dir, f"{fname}.jpg")
                 draw_spectrogram(estimates.T, sr, args.draw_spectro, output_img_path)
@@ -180,6 +170,7 @@ def run_folder(
 
     print(f"Elapsed time: {time.time() - start_time:.2f} seconds.")
 
+    
 def format_filename(template, **kwargs):
     '''
     Formats a filename from a template. e.g "{file_name}/{instr}"
